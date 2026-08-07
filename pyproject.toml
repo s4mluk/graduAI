@@ -1,0 +1,13 @@
+[project]
+name = "testbench"
+version = "0.1.0"
+description = "Testbench: LLM Agent Token Optimization Strategies (master's thesis)"
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic>=0.69",
+    "datasets>=5.0.1",
+    "huggingface-hub>=1.26.0",
+    "matplotlib>=3.11.1",
+    "python-dotenv>=1.0",
+    "tqdm>=4.70.0",
+]

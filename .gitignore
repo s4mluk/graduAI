@@ -1,0 +1,10 @@
+# Salaisuudet — ei koskaan Gitiin.
+.env
+
+# Ympäristö ja käännösjäte.
+.venv/
+__pycache__/
+*.pyc
+
+# Huom: results/ ja uv.lock ovat tarkoituksella versioitu.
+# results/ = gradun empiirinen data, uv.lock = ajojen toistettavuus.
