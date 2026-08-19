@@ -34,8 +34,18 @@ def load_all_runs() -> list[dict]:
     return runs
 
 
+def scored_only(runs: list[dict]) -> list[dict]:
+    """Drop runs with no `success` field.
+
+    Runs recorded before Phase 5 have no score. Counting them as failures would
+    understate the success rate of whichever strategy happened to run first."""
+    return [r for r in runs if "success" in r]
+
+
 def summarize(runs: list[dict]) -> dict[str, dict]:
-    """Per strategy: n runs, mean cost, success rate, cost per success."""
+    """Per strategy: n runs, mean cost, success rate, cost per success.
+
+    Expects only scored runs (see `scored_only`)."""
     by_strategy = defaultdict(list)
     for r in runs:
         by_strategy[r["strategy"]].append(r)
@@ -44,7 +54,7 @@ def summarize(runs: list[dict]) -> dict[str, dict]:
     for strat, rs in by_strategy.items():
         n = len(rs)
         total_cost = sum(r["cost_eur"] for r in rs)
-        n_success = sum(1 for r in rs if r.get("success"))
+        n_success = sum(1 for r in rs if r["success"])
         summary[strat] = {
             "n": n,
             "mean_cost": total_cost / n,
@@ -135,11 +145,20 @@ def plot(summary: dict[str, dict], frontier: set[str]) -> None:
 
 
 def main() -> None:
-    runs = load_all_runs()
-    if not runs:
+    all_runs = load_all_runs()
+    if not all_runs:
         print("No results found under results/*/run.jsonl. Run some tasks first.")
         return
-    print(f"Loaded {len(runs)} runs from results/*/run.jsonl")
+
+    runs = scored_only(all_runs)
+    unscored = len(all_runs) - len(runs)
+    print(f"Loaded {len(all_runs)} runs from results/*/run.jsonl")
+    if unscored:
+        print(f"Skipped {unscored} unscored runs (recorded before Phase 5).")
+    if not runs:
+        print("No scored runs to analyze.")
+        return
+
     summary = summarize(runs)
     frontier = pareto_frontier(summary)
     print_table(summary, frontier)

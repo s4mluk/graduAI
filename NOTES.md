@@ -50,21 +50,65 @@ Kaikki strategiat käyttävät `web_search`-työkalussa `max_uses = 5` (asetettu
 Tämä on tietoinen suunnitteluvalinta, ei oletusarvo. Kaikki alla olevat
 pilottitulokset on ajettu tällä asetuksella.
 
+## 2026-08-19 — Cachattavan prefiksin minimipituus: system-prompt ei cachaudu
+
+**Löydös:** `prompt_caching`-strategian `cache_control`-merkintä system-promptissa
+ei luo cache-entryä lainkaan. Anthropicin cachattavan prefiksin minimipituus on
+Sonnet 4.5:llä **1024 tokenia** ja Haiku 4.5:llä **4096**; meidän `SYSTEM_PROMPT`
+on ~100 tokenia. Minimin alittava prefiksi jätetään cachaamatta **hiljaisesti** —
+ei virhettä, ei varoitusta, `cache_creation_input_tokens` vain pysyy nollassa
+siltä breakpointilta.
+
+**Seuraus tulkintaan:** kaikki 31.7. havaitut cache-osumat (8581 read / 10149
+write) tulevat *top-level* `cache_control`-parametrista, eivät system-promptista.
+Top-level auto-cache osuu viestiprefiksiin, joka kasvaa serverin sisäisessä
+web_search-silmukassa yli minimin. Eli:
+
+| Mekanismi | Toimiiko | Miksi |
+|---|---|---|
+| `cache_control` system-promptissa | ei | ~100 tokenia < 1024 minimi |
+| top-level `cache_control` | kyllä | serverin silmukka kasvattaa prefiksin yli minimin |
+
+**Miksi tämä on tärkeä graduun:** aiempi kuvaus mekanismista oli väärä, ja väärä
+kuvaus mekanismista on vakavampi virhe kuin väärä mittaus — mittauksen voi toistaa,
+mutta väite siitä *miksi* jokin toimii kantaa läpi koko analyysin. Cachingin
+hyöty tässä testipenkissä ei tule siitä, mitä me merkitsemme cachattavaksi, vaan
+siitä mitä serverin sisäinen silmukka sattuu tuottamaan. Tämä vahvistaa 31.7.
+kirjattua mittausmenetelmän rajoitetta: emme ohjaa sitä, mistä hyöty syntyy.
+
+**Vaihtoehto jos caching halutaan aidosti mitattavaksi:** system-promptin pitäisi
+olla >1024 tokenia (esim. few-shot-esimerkkejä tai laajempi ohjeistus). Se olisi
+kuitenkin eri koeasetelma — nykyisillä tuloksilla mitataan caching-hyötyä
+*lyhyellä* system-promptilla, mikä on itsessään realistinen tapaus.
+
 ## Strategiat (Phase 4) — kuvaukset ja pilottitulokset
 
-Neljä strategiaa, kaikki Sonnet 4.5:llä paitsi routing, joka käyttää myös
+Viisi strategiaa, kaikki Sonnet 4.5:llä paitsi routing, joka käyttää myös
 Haiku 4.5:tä:
 
 - **baseline** — täysi konteksti, natiivi web-haku, ei optimointia. Vertailukohta.
-- **prompt_caching** — `cache_control` system-promptissa + viestiprefiksin
-  auto-cache. Natiivi ominaisuus. Varaus: vaikutus pieni yhden kutsun tehtävissä
-  (ks. yllä oleva serverin sisäisen silmukan löydös).
+- **prompt_caching** — top-level `cache_control` (viestiprefiksin auto-cache).
+  Natiivi ominaisuus. Huom: koodissa on myös `cache_control` system-promptissa,
+  mutta se ei tee mitään — ks. alla oleva minimipituusrajoitus.
 - **model_routing** — Haiku vastaa ensin ja raportoi itsevarmuutensa; jos
   "high", pidetään Haikun halpa vastaus; muuten eskaloidaan Sonnetille. Kustannus
   summataan molempien mallien yli.
 - **context_compression** — natiivi context editing (`clear_tool_uses`) tyhjentää
   vanhat työkalutulokset kun konteksti kasvaa. Varaus: yhden kutsun tehtävissä ei
   ole mitään tyhjennettävää.
+- **context_isolation** — orkestraattori pilkkoo kysymyksen enintään kolmeen
+  itsenäiseen osakysymykseen; kukin subagentti näkee vain oman osatehtävänsä,
+  ei alkuperäistä kysymystä eikä muiden työtä. Orkestraattori kokoaa
+  osavastaukset. Ainoa strategia jossa `api_calls > 1` on meidän hallinnassamme:
+  2 orkestraattorikutsua (suunnittelu + synteesi, ei hakua) + 1 per subagentti.
+
+**Hakubudjetin jako (19.8.).** Subagentit *jakavat* saman viiden haun budjetin
+(`ceil(5/N)` per subagentti) sen sijaan että kukin saisi oman viidenkön. Muuten
+kolmen subagentin ajo saisi 15 hakua siinä missä baseline sai 5, ja
+kustannusero heijastaisi hakubudjettia eikä kontekstin eristystä — sama
+perustelu kuin `max_uses = 5` -päätöksessä yllä. Osatehtävien katto on 3, jolloin
+kokonaishakumäärä on 5–6 riippumatta N:stä (1→5, 2→3+3, 3→2+2+2) eikä yksikään
+subagentti jää yhden haun varaan.
 
 **Pilotti** (2 tehtävää, 1 toisto, `max_uses=5`):
 

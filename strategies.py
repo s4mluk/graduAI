@@ -12,6 +12,9 @@ All strategies share one agent loop (`_run_loop`); a strategy decides what to
 pass into the API call (model, cached system, context editing, ...).
 """
 
+import math
+import re
+
 import anthropic
 
 import config
@@ -36,11 +39,38 @@ ROUTING_SYSTEM = SYSTEM_PROMPT + (
     "needs several steps, or you are unsure, answer 'low'."
 )
 
+# For context_isolation. The 3-subtask cap keeps the total search budget at
+# 5-6 uses whatever the split, and stops any subagent being left with one
+# search (ceil(5/3) = 2). See NOTES.md.
+MAX_SUBTASKS = 3
+
+DECOMPOSE_SYSTEM = (
+    "You plan research. Split the question into independent sub-questions that "
+    f"can each be researched on their own, at most {MAX_SUBTASKS}. Use fewer "
+    "when the question does not decompose. Each sub-question must stand alone: "
+    "someone who has never seen the original question must be able to research "
+    "it, so name entities in full and do not refer to the other sub-questions. "
+    "Output one sub-question per line and nothing else — no numbering, no "
+    "preamble, no blank lines."
+)
+
+SUBAGENT_SYSTEM = (
+    "You are a research subagent working on one part of a larger task you "
+    "cannot see. Answer only the question given, using the web_search tool when "
+    "you need facts you are unsure of. Reply in at most three sentences: the "
+    "answer plus the evidence it rests on. If you cannot find it, say so "
+    "plainly rather than guessing."
+)
+
 # Sonnet 4.5 / Haiku 4.5 use the basic web search tool (the dynamic-filtering
 # variant needs Sonnet 4.6+). max_uses caps searches per run: production realism
-# + budget control, and it must be identical across strategies so they stay
-# comparable. See NOTES.md.
-WEB_SEARCH_TOOL = {"type": "web_search_20250305", "name": "web_search", "max_uses": 5}
+# + budget control, and the total per task must stay comparable across
+# strategies, or a cost difference just reflects search depth. See NOTES.md.
+WEB_SEARCH_MAX_USES = 5
+
+
+def _web_search_tool(max_uses: int = WEB_SEARCH_MAX_USES) -> dict:
+    return {"type": "web_search_20250305", "name": "web_search", "max_uses": max_uses}
 
 _client: anthropic.Anthropic | None = None
 
@@ -65,18 +95,26 @@ def _cost(model: str, r: dict) -> float:
 
 
 def _run_loop(
-    task: dict,
+    question: str,
     model: str,
     system,
+    tools: list | None = None,
     extra_kwargs: dict | None = None,
     beta: bool = False,
 ) -> dict:
     """Shared agent loop: ask the question, let the server-side web search run,
     handle pause_turn, accumulate token usage. Returns tokens + answer (no cost;
-    the caller adds cost and model, since one strategy may use two models)."""
+    the caller adds cost and model, since one strategy may use two models).
+
+    `tools` defaults to web search at the shared cap; pass [] for a call that
+    should not search (the orchestrator's planning and synthesis steps)."""
     client = _get_client()
-    messages = [{"role": "user", "content": task["question"]}]
+    messages = [{"role": "user", "content": question}]
     extra_kwargs = extra_kwargs or {}
+    if tools is None:
+        tools = [_web_search_tool()]
+    if tools:
+        extra_kwargs = {**extra_kwargs, "tools": tools}
     create = client.beta.messages.create if beta else client.messages.create
 
     input_tokens = output_tokens = cache_read = cache_write = 0
@@ -87,7 +125,6 @@ def _run_loop(
             model=model,
             max_tokens=config.MAX_TOKENS,
             system=system,
-            tools=[WEB_SEARCH_TOOL],
             messages=messages,
             **extra_kwargs,
         )
@@ -118,6 +155,30 @@ def _run_loop(
     }
 
 
+def _merge(parts: list[dict]) -> dict:
+    """Sum token counts and api_calls over several _run_loop results, for
+    strategies that make more than one call per task."""
+    keys = (
+        "input_tokens",
+        "output_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "api_calls",
+    )
+    return {k: sum(p[k] for p in parts) for k in keys}
+
+
+def _parse_subtasks(text: str) -> list[str]:
+    """One sub-question per line. Tolerates the model numbering or bulleting
+    them anyway; caps the count so the search budget stays predictable."""
+    subtasks = []
+    for line in text.splitlines():
+        line = re.sub(r"^\s*(?:[-*•]|\d+[.)])\s*", "", line).strip()
+        if line:
+            subtasks.append(line)
+    return subtasks[:MAX_SUBTASKS]
+
+
 def _parse_confidence(text: str) -> str:
     """Read the 'CONFIDENCE: high/low' line; default to 'low' (escalate) if
     it's missing or unclear."""
@@ -140,7 +201,7 @@ def _strip_confidence(text: str) -> str:
 
 def run_baseline(task: dict) -> dict:
     """Full context, native web search, no optimization."""
-    r = _run_loop(task, config.SONNET, SYSTEM_PROMPT)
+    r = _run_loop(task["question"], config.SONNET, SYSTEM_PROMPT)
     return {**r, "model": config.SONNET, "cost_eur": _cost(config.SONNET, r)}
 
 
@@ -151,7 +212,7 @@ def run_prompt_caching(task: dict) -> dict:
         {"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}
     ]
     r = _run_loop(
-        task,
+        task["question"],
         config.SONNET,
         cached_system,
         extra_kwargs={"cache_control": {"type": "ephemeral"}},
@@ -163,7 +224,7 @@ def run_context_compression(task: dict) -> dict:
     """Anthropic native context editing: clear old tool results as context
     grows (keeps the transcript lean without summarizing)."""
     r = _run_loop(
-        task,
+        task["question"],
         config.SONNET,
         SYSTEM_PROMPT,
         beta=True,
@@ -178,7 +239,7 @@ def run_context_compression(task: dict) -> dict:
 def run_model_routing(task: dict) -> dict:
     """Haiku assesses the task first; if it is confident, keep its (cheap)
     answer. Otherwise escalate to Sonnet. Cost is summed across both models."""
-    haiku = _run_loop(task, config.HAIKU, ROUTING_SYSTEM)
+    haiku = _run_loop(task["question"], config.HAIKU, ROUTING_SYSTEM)
     haiku_cost = _cost(config.HAIKU, haiku)
 
     if _parse_confidence(haiku["answer"]) == "high":
@@ -190,7 +251,7 @@ def run_model_routing(task: dict) -> dict:
         }
 
     # Not confident -> escalate to Sonnet with a fresh run.
-    sonnet = _run_loop(task, config.SONNET, SYSTEM_PROMPT)
+    sonnet = _run_loop(task["question"], config.SONNET, SYSTEM_PROMPT)
     return {
         "answer": sonnet["answer"],
         "input_tokens": haiku["input_tokens"] + sonnet["input_tokens"],
@@ -203,9 +264,62 @@ def run_model_routing(task: dict) -> dict:
     }
 
 
+def run_context_isolation(task: dict) -> dict:
+    """Orchestrator splits the question into independent subtasks; each subagent
+    gets only its own subtask, never the question or the other subagents' work.
+    The orchestrator then synthesizes the subanswers.
+
+    Cost is 2 orchestrator calls (plan + synthesize, no search) plus one call
+    per subagent. The search budget is split rather than duplicated, so the
+    total stays comparable to the other strategies -- see NOTES.md."""
+    parts = []
+
+    # 1. Plan. No search: this step only rewrites the question.
+    plan = _run_loop(task["question"], config.SONNET, DECOMPOSE_SYSTEM, tools=[])
+    parts.append(plan)
+    subtasks = _parse_subtasks(plan["answer"]) or [task["question"]]
+
+    # 2. Subagents, each with an isolated context and a share of the budget.
+    per_agent_uses = math.ceil(WEB_SEARCH_MAX_USES / len(subtasks))
+    findings = []
+    for subtask in subtasks:
+        sub = _run_loop(
+            subtask,
+            config.SONNET,
+            SUBAGENT_SYSTEM,
+            tools=[_web_search_tool(per_agent_uses)],
+        )
+        parts.append(sub)
+        findings.append((subtask, sub["answer"]))
+
+    # 3. Synthesize. No search: answer from the findings only.
+    brief = "\n\n".join(
+        f"[{i}] Sub-question: {q}\nFinding: {a}"
+        for i, (q, a) in enumerate(findings, start=1)
+    )
+    synthesis = _run_loop(
+        f"Question: {task['question']}\n\n"
+        f"Independent researchers reported these findings:\n\n{brief}\n\n"
+        "Answer the question using these findings.",
+        config.SONNET,
+        SYSTEM_PROMPT,
+        tools=[],
+    )
+    parts.append(synthesis)
+
+    merged = _merge(parts)
+    return {
+        **merged,
+        "answer": synthesis["answer"],
+        "model": config.SONNET,
+        "cost_eur": _cost(config.SONNET, merged),
+    }
+
+
 STRATEGIES = {
     "baseline": run_baseline,
     "prompt_caching": run_prompt_caching,
     "model_routing": run_model_routing,
     "context_compression": run_context_compression,
+    "context_isolation": run_context_isolation,
 }
