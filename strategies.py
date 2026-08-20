@@ -206,8 +206,13 @@ def run_baseline(task: dict) -> dict:
 
 
 def run_prompt_caching(task: dict) -> dict:
-    """Mark the system prompt (and tools) with cache_control and auto-cache the
-    message prefix. See NOTES.md for the single-call caveat."""
+    """Top-level cache_control auto-caches the message prefix, which is what
+    actually produces cache hits here: the server-side search loop grows the
+    prefix past the cacheable minimum.
+
+    The system-prompt breakpoint below is kept because it is the textbook way to
+    apply caching, but at ~100 tokens it is under Sonnet 4.5's 1024-token
+    minimum and silently never caches. See NOTES.md (2026-08-19)."""
     cached_system = [
         {"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}
     ]
