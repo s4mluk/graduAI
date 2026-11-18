@@ -6,7 +6,8 @@ Requires a HuggingFace account, acceptance of GAIA's terms, and a local login
 Loads the validation split (the one with answers), keeps only text-based tasks
 (no attachments), takes a stratified random sample of 12 level-1, 8 level-2 and
 4 level-3 tasks (random_state=42 for reproducibility), and writes
-tasks/gaia_sample.json in the format tasks.py expects.
+tasks/gaia_sample.json in the format tasks.py expects. Answers are deliberately
+not written (GAIA asks they are not published); tasks.py loads them at runtime.
 
     uv run scripts/download_gaia.py
 """
@@ -51,7 +52,6 @@ def main() -> None:
                     "task_id": row["task_id"],
                     "question": row["Question"],
                     "level": int(row["Level"]),
-                    "answer": row["Final answer"],
                 }
             )
 
