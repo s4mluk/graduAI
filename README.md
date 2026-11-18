@@ -1,7 +1,28 @@
 # Testbench: LLM Agent Token Optimization Strategies
 
+> Empirical part of my master's thesis at Aalto University.
+
 Empirical part of a master's thesis. Runs the same GAIA task set under different
 token-optimization strategies and measures cost per successful task.
+
+## Key findings
+
+Pilot results so far (24-task GAIA sample is defined; only a handful of runs completed, so **n = 3 per strategy, 1 for `context_isolation`**). Directional only, not statistically meaningful. Produced by `analyze.py` from `results/`.
+
+| Strategy | Runs | Mean cost (EUR) | Success | EUR per success |
+|---|---|---|---|---|
+| `model_routing` | 3 | 0.0285 | 33 % | 0.0855 |
+| `context_isolation` | 1 | 0.0350 | 0 % | n/a |
+| `prompt_caching` | 3 | 0.0500 | 33 % | 0.1499 |
+| `context_compression` | 3 | 0.0580 | 33 % | 0.1740 |
+| `baseline` | 3 | 0.0581 | 33 % | 0.1742 |
+
+- `model_routing` (Haiku first, escalate to Sonnet if unsure) is about half the cost of `baseline` at the same pilot accuracy, and is the only strategy on the Pareto frontier.
+- `prompt_caching` is slightly cheaper than `baseline`; `context_compression` is about equal to `baseline` (single-call tasks leave little to compress).
+- Haiku's self-reported confidence is poorly calibrated: it was confident but wrong on one task and did not escalate.
+- The full comparison (`--repeats 3-5` over all 24 tasks) is the next paid run.
+
+![Cost vs success Pareto plot](results/pareto.png)
 
 ## Setup
 
@@ -29,6 +50,8 @@ uv run run.py --strategy baseline --resume results/20260819_150522
 | `--resume` | new dir | Continue an existing results dir instead of starting fresh |
 
 Always smoke-test with `--limit 1` before a large run.
+
+**GAIA ground truth:** answers are not stored in the repo (GAIA asks they are not published in crawlable form). They are loaded at runtime from the gated HF dataset `gaia-benchmark/GAIA`: accept its terms and run `hf auth login` first.
 
 ## Analyze
 
